@@ -34,7 +34,6 @@ pub struct CrateReleasePlan {
 pub struct CrateReleaseNotes {
     pub crate_name: String,
     pub manifest_path: PathBuf,
-    pub version: Version,
     pub base_ref: Option<String>,
     pub commits: Vec<PlannedCommit>,
 }
@@ -173,7 +172,6 @@ pub fn build_crate_release_notes_with_history(
         notes.push(CrateReleaseNotes {
             crate_name: crate_info.name.clone(),
             manifest_path: crate_info.manifest_path.clone(),
-            version: crate_info.version.clone(),
             base_ref,
             commits,
         });
@@ -1115,10 +1113,6 @@ mod tests {
             .expect("build release notes");
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].crate_name, "demo");
-        assert_eq!(
-            notes[0].version,
-            Version::parse("0.2.0").expect("valid semver")
-        );
         assert_eq!(notes[0].base_ref.as_deref(), Some("demo-v0.1.0"));
         assert_eq!(notes[0].commits.len(), 1);
         assert_eq!(notes[0].commits[0].subject, "feat: add api");
