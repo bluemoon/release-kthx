@@ -1,26 +1,52 @@
 use crate::release::{CommitKind, ReleasePlan};
+use release_kthx_domain::PlannedCommit;
 
 pub fn render_markdown(plan: &ReleasePlan) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("## {}\n\n", plan.next_version));
+    let version = plan.next_version.to_string();
+    render_sections(
+        Some(version.as_str()),
+        plan.base_tag.as_deref(),
+        &plan.commits,
+    )
+}
 
-    if let Some(base_tag) = &plan.base_tag {
-        out.push_str(&format!("Changes since `{}`\n\n", base_tag));
+pub fn render_release_notes(base_ref: Option<&str>, commits: &[PlannedCommit]) -> String {
+    render_sections(None, base_ref, commits)
+}
+
+fn render_sections(
+    version_heading: Option<&str>,
+    base_ref: Option<&str>,
+    commits: &[PlannedCommit],
+) -> String {
+    let mut out = String::new();
+
+    if let Some(version_heading) = version_heading {
+        out.push_str(&format!("## {}\n\n", version_heading));
     }
 
-    append_section(&mut out, "Features", plan, CommitKind::Feature);
-    append_section(&mut out, "Fixes", plan, CommitKind::Fix);
-    append_section(&mut out, "Refactors", plan, CommitKind::Refactor);
-    append_section(&mut out, "Documentation", plan, CommitKind::Documentation);
-    append_section(&mut out, "Chores", plan, CommitKind::Chore);
-    append_section(&mut out, "Other", plan, CommitKind::Other);
+    if let Some(base_ref) = base_ref {
+        out.push_str(&format!("Changes since `{}`\n\n", base_ref));
+    }
+
+    append_section(&mut out, "Features", commits, CommitKind::Feature);
+    append_section(&mut out, "Fixes", commits, CommitKind::Fix);
+    append_section(&mut out, "Refactors", commits, CommitKind::Refactor);
+    append_section(
+        &mut out,
+        "Documentation",
+        commits,
+        CommitKind::Documentation,
+    );
+    append_section(&mut out, "Chores", commits, CommitKind::Chore);
+    append_section(&mut out, "Other", commits, CommitKind::Other);
 
     out
 }
 
-fn append_section(out: &mut String, title: &str, plan: &ReleasePlan, kind: CommitKind) {
+fn append_section(out: &mut String, title: &str, commits: &[PlannedCommit], kind: CommitKind) {
     let mut wrote_any = false;
-    for commit in &plan.commits {
+    for commit in commits {
         if commit.kind == kind {
             if !wrote_any {
                 out.push_str(&format!("### {}\n", title));
@@ -75,5 +101,20 @@ mod tests {
         let text = render_markdown(&plan);
         assert!(text.contains("### Features"));
         assert!(text.contains("add private release mode"));
+    }
+
+    #[test]
+    fn release_notes_skip_version_heading() {
+        let commits = vec![PlannedCommit {
+            hash: "abcdef123456".to_string(),
+            subject: "fix: patch parser".to_string(),
+            kind: CommitKind::Fix,
+            breaking: false,
+        }];
+
+        let text = render_release_notes(Some("v0.1.0"), &commits);
+        assert!(!text.starts_with("## "));
+        assert!(text.contains("Changes since `v0.1.0`"));
+        assert!(text.contains("### Fixes"));
     }
 }

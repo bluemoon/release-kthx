@@ -3,7 +3,8 @@ use anyhow::{Context, Result, bail};
 pub use release_kthx_domain::{CommitKind, ReleasePlan};
 use release_kthx_domain::{
     DependencyOwner, DependencySource, InternalDependencyContext, InternalDependencyPolicy,
-    Publication, RequirementStyle, WorkspaceCrate, WorkspaceGraph, desired_requirement_style,
+    PlannedCommit, Publication, RequirementStyle, WorkspaceCrate, WorkspaceGraph,
+    desired_requirement_style,
 };
 use semver::Version;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -27,6 +28,14 @@ pub struct CrateReleasePlan {
     pub crate_name: String,
     pub manifest_path: PathBuf,
     pub plan: ReleasePlan,
+}
+
+#[derive(Debug, Clone)]
+pub struct CrateReleaseNotes {
+    pub crate_name: String,
+    pub manifest_path: PathBuf,
+    pub base_ref: Option<String>,
+    pub commits: Vec<PlannedCommit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,20 +105,8 @@ pub fn build_crate_release_plans_with_history(
             continue;
         }
 
-        let mut commit_inputs = Vec::new();
-        for commit in raw_commits {
-            let directly_affected = directly_affected_crates(&crates, &commit.files);
-            let topology = workspace_graph.release_topology(directly_affected.iter());
-            if !topology.includes(&crate_info.name) {
-                continue;
-            }
-
-            commit_inputs.push(release_kthx_domain::CommitInput {
-                hash: commit.hash,
-                subject: commit.subject,
-                body: commit.body,
-            });
-        }
+        let commit_inputs =
+            crate_commit_inputs(raw_commits, &crates, &workspace_graph, &crate_info.name);
 
         let Some(plan) = release_kthx_domain::plan_release(
             crate_info.version.clone(),
@@ -128,6 +125,60 @@ pub fn build_crate_release_plans_with_history(
 
     plans.sort_by(|a, b| a.manifest_path.cmp(&b.manifest_path));
     Ok(plans)
+}
+
+pub fn build_crate_release_notes(
+    path: &Path,
+    tag_template: &str,
+) -> Result<Vec<CrateReleaseNotes>> {
+    let history = CliCommitHistoryService;
+    build_crate_release_notes_with_history(&history, path, tag_template)
+}
+
+pub fn build_crate_release_notes_with_history(
+    history: &impl CommitHistoryService,
+    path: &Path,
+    tag_template: &str,
+) -> Result<Vec<CrateReleaseNotes>> {
+    let crates = collect_crates(path)?;
+    if crates.is_empty() {
+        bail!("no Cargo package manifests found");
+    }
+    let workspace_graph =
+        WorkspaceGraph::from_crates(crates.iter().map(|crate_info| WorkspaceCrate {
+            name: crate_info.name.clone(),
+            local_dependencies: crate_info.local_dependencies.iter().cloned().collect(),
+        }));
+
+    let crate_count = crates.len();
+    let mut notes = Vec::new();
+    for crate_info in crates.iter() {
+        let base_ref =
+            resolve_previous_base_reference(history, path, tag_template, crate_info, crate_count)?;
+
+        let raw_commits = history.collect_commits(path, base_ref.as_deref())?;
+        if raw_commits.is_empty() {
+            continue;
+        }
+
+        let commits = crate_commit_inputs(raw_commits, &crates, &workspace_graph, &crate_info.name)
+            .into_iter()
+            .map(|input| PlannedCommit::from_input(input).0)
+            .collect::<Vec<_>>();
+        if commits.is_empty() {
+            continue;
+        }
+
+        notes.push(CrateReleaseNotes {
+            crate_name: crate_info.name.clone(),
+            manifest_path: crate_info.manifest_path.clone(),
+            base_ref,
+            commits,
+        });
+    }
+
+    notes.sort_by(|a, b| a.manifest_path.cmp(&b.manifest_path));
+    Ok(notes)
 }
 
 fn resolve_base_reference(
@@ -159,6 +210,76 @@ fn resolve_base_reference(
     }
 
     history.latest_tag(path)
+}
+
+fn resolve_previous_base_reference(
+    history: &impl CommitHistoryService,
+    path: &Path,
+    tag_template: &str,
+    crate_info: &CrateInfo,
+    crate_count: usize,
+) -> Result<Option<String>> {
+    let Some(previous_version) = history.previous_version(
+        path,
+        &crate_info.manifest_path,
+        &crate_info.version.to_string(),
+    )?
+    else {
+        return history.latest_tag(path);
+    };
+
+    let previous_version = Version::parse(&previous_version).with_context(|| {
+        format!(
+            "invalid previous version for {} in {}",
+            crate_info.name,
+            crate_info.manifest_path.display()
+        )
+    })?;
+
+    let expected_tag = render_tag_name(
+        tag_template,
+        &crate_info.name,
+        &previous_version,
+        crate_count,
+    )?;
+    if history.tag_exists(path, &expected_tag)? {
+        return Ok(Some(expected_tag));
+    }
+
+    if let Some(commit) = history.find_version_commit(
+        path,
+        &crate_info.manifest_path,
+        &previous_version.to_string(),
+    )? {
+        return Ok(Some(commit));
+    }
+
+    history.latest_tag(path)
+}
+
+fn crate_commit_inputs(
+    raw_commits: Vec<crate::git::CommitRecord>,
+    crates: &[CrateInfo],
+    workspace_graph: &WorkspaceGraph,
+    crate_name: &str,
+) -> Vec<release_kthx_domain::CommitInput> {
+    let mut commit_inputs = Vec::new();
+
+    for commit in raw_commits {
+        let directly_affected = directly_affected_crates(crates, &commit.files);
+        let topology = workspace_graph.release_topology(directly_affected.iter());
+        if !topology.includes(crate_name) {
+            continue;
+        }
+
+        commit_inputs.push(release_kthx_domain::CommitInput {
+            hash: commit.hash,
+            subject: commit.subject,
+            body: commit.body,
+        });
+    }
+
+    commit_inputs
 }
 
 pub fn set_crate_versions(path: &Path, plans: &[CrateReleasePlan]) -> Result<Vec<PathBuf>> {
@@ -800,6 +921,7 @@ mod tests {
     use super::*;
     use release_kthx_domain::BumpLevel;
     use std::path::Path;
+    use std::process::Command;
 
     fn test_plan(crate_name: &str, current: &str, next: &str) -> CrateReleasePlan {
         CrateReleasePlan {
@@ -834,6 +956,59 @@ mod tests {
             ),
         )
         .expect("write crate manifest");
+    }
+
+    fn run_git_ok(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git command should run");
+
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        run_git_ok(dir.path(), &["init"]);
+        run_git_ok(dir.path(), &["config", "user.name", "tester"]);
+        run_git_ok(dir.path(), &["config", "user.email", "tester@example.com"]);
+        dir
+    }
+
+    fn commit_repo_files(repo: &Path, files: &[(&str, &str)], subject: &str, body: Option<&str>) {
+        for (relative, content) in files {
+            let path = repo.join(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("create parent directories");
+            }
+            fs::write(&path, content).expect("write file");
+            run_git_ok(repo, &["add", relative]);
+        }
+
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(repo)
+            .arg("commit")
+            .arg("--no-gpg-sign")
+            .arg("-m")
+            .arg(subject);
+        if let Some(body_text) = body {
+            cmd.arg("-m").arg(body_text);
+        }
+
+        let output = cmd.output().expect("commit should run");
+        assert!(
+            output.status.success(),
+            "commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -896,6 +1071,51 @@ mod tests {
     fn release_payload_rejects_non_release_files() {
         let files = vec![PathBuf::from("Cargo.toml"), PathBuf::from("README.md")];
         assert!(!is_release_merge_payload(&files));
+    }
+
+    #[test]
+    fn build_crate_release_notes_uses_previous_tag_boundary() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        commit_repo_files(
+            repo_path,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+                ),
+                ("src/lib.rs", "pub fn one() {}\n"),
+            ],
+            "feat: initial release",
+            None,
+        );
+        run_git_ok(repo_path, &["tag", "demo-v0.1.0"]);
+
+        commit_repo_files(
+            repo_path,
+            &[("src/lib.rs", "pub fn one() {}\npub fn two() {}\n")],
+            "feat: add api",
+            None,
+        );
+
+        commit_repo_files(
+            repo_path,
+            &[(
+                "Cargo.toml",
+                "[package]\nname = \"demo\"\nversion = \"0.2.0\"\nedition = \"2024\"\n",
+            )],
+            "chore(release): demo v0.2.0",
+            None,
+        );
+
+        let notes = build_crate_release_notes(repo_path, "{{ crate }}-v{{ version }}")
+            .expect("build release notes");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].crate_name, "demo");
+        assert_eq!(notes[0].base_ref.as_deref(), Some("demo-v0.1.0"));
+        assert_eq!(notes[0].commits.len(), 1);
+        assert_eq!(notes[0].commits[0].subject, "feat: add api");
     }
 
     #[test]

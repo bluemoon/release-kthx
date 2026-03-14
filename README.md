@@ -10,6 +10,7 @@ It ships first as a GitHub Action (Docker action), with a Rust CLI runtime insid
 - Conventional-commit based version planning from git history
 - Works with org-private repos and custom GitHub tokens in CI
 - PR-first release flow per crate: open release PR with crate version bumps, publish crate tags/releases after merge
+- GitHub releases include generated notes from crate-relevant conventional commits since the prior version
 - Private-workspace-aware internal dependency normalization (`auto`, `strip`, `update`)
 
 ## GitHub Action usage

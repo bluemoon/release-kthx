@@ -10,6 +10,7 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use cli::{Cli, Command};
 use config::ReleaseKthxConfig;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 fn main() -> Result<()> {
@@ -299,6 +300,15 @@ fn run_publish(path: PathBuf, dry_run: bool, push: bool) -> Result<()> {
     if crates.is_empty() {
         bail!("no Cargo package manifests found");
     }
+    let notes_by_crate = release::build_crate_release_notes(&path, &cfg.release.tag_template)?
+        .into_iter()
+        .map(|notes| {
+            (
+                notes.crate_name,
+                changelog::render_release_notes(notes.base_ref.as_deref(), &notes.commits),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
 
     let crate_count = crates.len();
     let mut pending = Vec::new();
@@ -350,10 +360,15 @@ fn run_publish(path: PathBuf, dry_run: bool, push: bool) -> Result<()> {
 
         if cfg.github.create_release {
             let title = format!("Release {} {}", crate_info.name, crate_info.version);
-            let notes = format!(
-                "Automated publish for crate `{}` at version `{}`.",
-                crate_info.name, crate_info.version
-            );
+            let notes = notes_by_crate
+                .get(&crate_info.name)
+                .cloned()
+                .unwrap_or_else(|| {
+                    format!(
+                        "Automated publish for crate `{}` at version `{}`.",
+                        crate_info.name, crate_info.version
+                    )
+                });
             let release_url = github::create_or_update_release(
                 &path,
                 &cfg.github.token_env,

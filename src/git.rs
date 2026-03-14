@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use toml::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitRecord {
@@ -15,6 +16,12 @@ pub trait CommitHistoryService {
     fn collect_commits(&self, path: &Path, from_tag: Option<&str>) -> Result<Vec<CommitRecord>>;
     fn tag_exists(&self, path: &Path, tag_name: &str) -> Result<bool>;
     fn find_version_commit(
+        &self,
+        path: &Path,
+        manifest_path: &Path,
+        version: &str,
+    ) -> Result<Option<String>>;
+    fn previous_version(
         &self,
         path: &Path,
         manifest_path: &Path,
@@ -45,6 +52,15 @@ impl CommitHistoryService for CliCommitHistoryService {
         version: &str,
     ) -> Result<Option<String>> {
         find_version_commit(path, manifest_path, version)
+    }
+
+    fn previous_version(
+        &self,
+        path: &Path,
+        manifest_path: &Path,
+        version: &str,
+    ) -> Result<Option<String>> {
+        previous_version(path, manifest_path, version)
     }
 }
 
@@ -145,6 +161,44 @@ pub fn find_version_commit(
     } else {
         Ok(Some(hash))
     }
+}
+
+pub fn previous_version(
+    path: &Path,
+    manifest_path: &Path,
+    version: &str,
+) -> Result<Option<String>> {
+    let Some(current_commit) = find_version_commit(path, manifest_path, version)? else {
+        return Ok(None);
+    };
+
+    let spec = format!("{}^:{}", current_commit, manifest_path.to_string_lossy());
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("show")
+        .arg(&spec)
+        .output()
+        .with_context(|| format!("failed reading {} at {}", manifest_path.display(), spec))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    manifest_package_version(&String::from_utf8_lossy(&output.stdout), manifest_path)
+}
+
+fn manifest_package_version(raw: &str, manifest_path: &Path) -> Result<Option<String>> {
+    let value = raw
+        .parse::<Value>()
+        .with_context(|| format!("failed parsing {}", manifest_path.display()))?;
+
+    Ok(value
+        .get("package")
+        .and_then(Value::as_table)
+        .and_then(|package| package.get("version"))
+        .and_then(Value::as_str)
+        .map(str::to_string))
 }
 
 pub fn collect_commits(path: &Path, from_tag: Option<&str>) -> Result<Vec<CommitRecord>> {
@@ -564,5 +618,38 @@ mod tests {
         let files = changed_files_between(repo_path, &before, &after).expect("changed files");
         assert!(files.contains(&PathBuf::from("Cargo.toml")));
         assert!(files.contains(&PathBuf::from("src/lib.rs")));
+    }
+
+    #[test]
+    fn previous_version_reads_parent_manifest_version() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        commit_files(
+            repo_path,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+                ),
+                ("src/lib.rs", "pub fn one() {}\n"),
+            ],
+            "feat: initial release",
+            None,
+        );
+
+        commit_files(
+            repo_path,
+            &[(
+                "Cargo.toml",
+                "[package]\nname = \"demo\"\nversion = \"0.2.0\"\nedition = \"2024\"\n",
+            )],
+            "chore(release): demo v0.2.0",
+            None,
+        );
+
+        let version = previous_version(repo_path, Path::new("Cargo.toml"), "0.2.0")
+            .expect("previous version");
+        assert_eq!(version.as_deref(), Some("0.1.0"));
     }
 }
